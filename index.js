@@ -1,0 +1,438 @@
+
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+} = require("discord.js");
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+});
+
+const games = new Map();
+
+const commands = [
+  new SlashCommandBuilder()
+    .setName("mafia-start")
+    .setDescription("Create a new Mafia game"),
+
+  new SlashCommandBuilder()
+    .setName("mafia-join")
+    .setDescription("Join the Mafia game"),
+
+  new SlashCommandBuilder()
+    .setName("mafia-begin")
+    .setDescription("Start the game and assign secret roles"),
+
+  new SlashCommandBuilder()
+    .setName("mafia-vote")
+    .setDescription("Vote to eliminate a player")
+    .addUserOption(option =>
+      option.setName("player")
+        .setDescription("Player to vote for")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("mafia-resolve")
+    .setDescription("Resolve the day's votes"),
+
+  new SlashCommandBuilder()
+    .setName("mafia-night")
+    .setDescription("Start the night phase"),
+
+  new SlashCommandBuilder()
+    .setName("mafia-kill")
+    .setDescription("Mafia: choose a player to eliminate")
+    .addUserOption(option =>
+      option.setName("player")
+        .setDescription("Player to target")
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("mafia-day")
+    .setDescription("End the night and announce the result"),
+
+  new SlashCommandBuilder()
+    .setName("mafia-end")
+    .setDescription("End the current game"),
+].map(command => command.toJSON());
+
+function alivePlayers(game) {
+  return [...game.players.values()].filter(p => p.alive);
+}
+
+function winner(game) {
+  const alive = alivePlayers(game);
+  const mafia = alive.filter(p => p.role === "Mafia").length;
+  const villagers = alive.length - mafia;
+
+  if (mafia === 0) return "The Villagers";
+  if (mafia >= villagers) return "The Mafia";
+  return null;
+}
+
+function gameFor(interaction) {
+  return games.get(interaction.guildId);
+}
+
+async function finishIfWon(interaction, game) {
+  const result = winner(game);
+
+  if (!result) return false;
+
+  await interaction.channel.send(
+    `🏆 **${result} win the game!**`
+  );
+
+  games.delete(interaction.guildId);
+  return true;
+}
+
+client.once("ready", async () => {
+  console.log(`Mafioso is online as ${client.user.tag}`);
+
+  const rest = new REST({ version: "10" }).setToken(
+    process.env.DISCORD_TOKEN
+  );
+
+  await rest.put(
+    Routes.applicationGuildCommands(
+      process.env.CLIENT_ID,
+      process.env.GUILD_ID
+    ),
+    { body: commands }
+  );
+
+  console.log("Mafioso slash commands are ready!");
+});
+
+client.on("interactionCreate", async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  if (!interaction.guildId) {
+    return interaction.reply({
+      content: "Please use Mafioso inside your server.",
+      ephemeral: true,
+    });
+  }
+
+  const id = interaction.user.id;
+  const command = interaction.commandName;
+  let game = gameFor(interaction);
+
+  try {
+    if (command === "mafia-start") {
+      if (game) {
+        return interaction.reply({
+          content: "A game already exists in this server.",
+          ephemeral: true,
+        });
+      }
+
+      game = {
+        phase: "lobby",
+        players: new Map(),
+        votes: new Map(),
+        nightTarget: null,
+      };
+
+      game.players.set(id, {
+        id,
+        name: interaction.user.username,
+        role: null,
+        alive: true,
+      });
+
+      games.set(interaction.guildId, game);
+
+      return interaction.reply(
+        "🎭 **Mafioso lobby created!**\n" +
+        "Use `/mafia-join` to join. " +
+        "The host can use `/mafia-begin` when at least 4 players have joined."
+      );
+    }
+
+    if (command === "mafia-end") {
+      if (!game) {
+        return interaction.reply({
+          content: "There is no active game.",
+          ephemeral: true,
+        });
+      }
+
+      games.delete(interaction.guildId);
+      return interaction.reply("🛑 The Mafia game has ended.");
+    }
+
+    if (!game) {
+      return interaction.reply({
+        content: "No game is active. Use `/mafia-start` first.",
+        ephemeral: true,
+      });
+    }
+
+    if (command === "mafia-join") {
+      if (game.phase !== "lobby") {
+        return interaction.reply({
+          content: "The game has already started.",
+          ephemeral: true,
+        });
+      }
+
+      if (game.players.has(id)) {
+        return interaction.reply({
+          content: "You have already joined!",
+          ephemeral: true,
+        });
+      }
+
+      game.players.set(id, {
+        id,
+        name: interaction.user.username,
+        role: null,
+        alive: true,
+      });
+
+      return interaction.reply(
+        `✅ ${interaction.user.username} joined! ` +
+        `Players: ${game.players.size}`
+      );
+    }
+
+    if (command === "mafia-begin") {
+      if (game.phase !== "lobby") {
+        return interaction.reply({
+          content: "The game has already begun.",
+          ephemeral: true,
+        });
+      }
+
+      if (game.players.size < 4) {
+        return interaction.reply({
+          content: "You need at least 4 players to begin.",
+          ephemeral: true,
+        });
+      }
+
+      const players = [...game.players.values()];
+      const roles = [
+        ...Array(players.length >= 7 ? 2 : 1).fill("Mafia"),
+        ...Array(players.length - (players.length >= 7 ? 2 : 1))
+          .fill("Villager"),
+      ];
+
+      for (let i = roles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [roles[i], roles[j]] = [roles[j], roles[i]];
+      }
+
+      for (let i = 0; i < players.length; i++) {
+        players[i].role = roles[i];
+
+        try {
+          await client.users.send(
+            players[i].id,
+            `🎭 Your secret role in Mafioso is: **${roles[i]}**`
+          );
+        } catch {
+          // A player may have DMs disabled.
+        }
+      }
+
+      game.phase = "day";
+      game.votes.clear();
+
+      await interaction.reply(
+        "🌞 **The game has begun!** Roles have been assigned. " +
+        "Check your DMs. Use `/mafia-vote` during the day."
+      );
+
+      return;
+    }
+
+    if (command === "mafia-vote") {
+      if (game.phase !== "day") {
+        return interaction.reply({
+          content: "Voting is only available during the day.",
+          ephemeral: true,
+        });
+      }
+
+      const voter = game.players.get(id);
+      const targetUser = interaction.options.getUser("player");
+      const target = game.players.get(targetUser.id);
+
+      if (!voter?.alive || !target?.alive || id === targetUser.id) {
+        return interaction.reply({
+          content: "Choose another living player.",
+          ephemeral: true,
+        });
+      }
+
+      game.votes.set(id, targetUser.id);
+
+      return interaction.reply({
+        content: `🗳️ Your vote for **${target.name}** has been recorded.`,
+        ephemeral: true,
+      });
+    }
+
+    if (command === "mafia-resolve") {
+      if (game.phase !== "day") {
+        return interaction.reply({
+          content: "Votes can only be resolved during the day.",
+          ephemeral: true,
+        });
+      }
+
+      const tally = new Map();
+
+      for (const [voterId, targetId] of game.votes) {
+        if (
+          game.players.get(voterId)?.alive &&
+          game.players.get(targetId)?.alive
+        ) {
+          tally.set(targetId, (tally.get(targetId) || 0) + 1);
+        }
+      }
+
+      if (tally.size === 0) {
+        return interaction.reply("No votes have been cast.");
+      }
+
+      const highest = Math.max(...tally.values());
+      const leaders = [...tally.entries()].filter(
+        ([, votes]) => votes === highest
+      );
+
+      game.votes.clear();
+
+      if (leaders.length > 1) {
+        return interaction.reply(
+          "🤝 The vote is tied. Nobody is eliminated."
+        );
+      }
+
+      const target = game.players.get(leaders[0][0]);
+      target.alive = false;
+
+      await interaction.reply(
+        `⚖️ **${target.name}** was eliminated by the vote. ` +
+        `Their role was **${target.role}**.`
+      );
+
+      await finishIfWon(interaction, game);
+      return;
+    }
+
+    if (command === "mafia-night") {
+      if (game.phase !== "day") {
+        return interaction.reply({
+          content: "It is not daytime.",
+          ephemeral: true,
+        });
+      }
+
+      game.phase = "night";
+      game.nightTarget = null;
+
+      return interaction.reply(
+        "🌙 **Night has fallen!** The Mafia can use `/mafia-kill`."
+      );
+    }
+
+    if (command === "mafia-kill") {
+      if (game.phase !== "night") {
+        return interaction.reply({
+          content: "The Mafia can only act at night.",
+          ephemeral: true,
+        });
+      }
+
+      const actor = game.players.get(id);
+      const targetUser = interaction.options.getUser("player");
+      const target = game.players.get(targetUser.id);
+
+      if (!actor?.alive || actor.role !== "Mafia") {
+        return interaction.reply({
+          content: "Only a living Mafia member can use this command.",
+          ephemeral: true,
+        });
+      }
+
+      if (!target?.alive || target.role === "Mafia") {
+        return interaction.reply({
+          content: "Choose a living player who is not Mafia.",
+          ephemeral: true,
+        });
+      }
+
+      game.nightTarget = targetUser.id;
+
+      return interaction.reply({
+        content: "🌙 Your night target has been selected.",
+        ephemeral: true,
+      });
+    }
+
+    if (command === "mafia-day") {
+      if (game.phase !== "night") {
+        return interaction.reply({
+          content: "It is not nighttime.",
+          ephemeral: true,
+        });
+      }
+
+      game.phase = "day";
+
+      let message = "🌞 **Day has arrived!** ";
+
+      if (game.nightTarget) {
+        const target = game.players.get(game.nightTarget);
+
+        if (target?.alive) {
+          target.alive = false;
+          message += `**${target.name}** was eliminated during the night. `;
+          message += `Their role was **${target.role}**.`;
+        }
+      } else {
+        message += "Nobody was eliminated during the night.";
+      }
+
+      game.nightTarget = null;
+      game.votes.clear();
+
+      await interaction.reply(message);
+      await finishIfWon(interaction, game);
+      return;
+    }
+  } catch (error) {
+    console.error(error);
+
+    const response = {
+      content: "Something went wrong. Please try again.",
+      ephemeral: true,
+    };
+
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp(response).catch(() => {});
+    } else {
+      await interaction.reply(response).catch(() => {});
+    }
+  }
+});
+
+if (
+  !process.env.DISCORD_TOKEN ||
+  !process.env.CLIENT_ID ||
+  !process.env.GUILD_ID
+) {
+  throw new Error(
+    "Set DISCORD_TOKEN, CLIENT_ID, and GUILD_ID before starting Mafioso."
+  );
+}
+
+client.login(process.env.DISCORD_TOKEN);
